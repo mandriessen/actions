@@ -11,9 +11,9 @@ inputs:
     description: 'GitHub Packages read token. Pass secrets.GH_PKG_TOKEN (fleet-canonical secret name).'
     required: true
   run-gitleaks:
-    description: 'Run gitleaks secret scan on the checkout (set "false" only if another step already does this)'
+    description: 'Run gitleaks secret scan (requires `fetch-depth: 0` on checkout). Default false — consumers can opt-in.'
     required: false
-    default: 'true'
+    default: 'false'
   enforce-mandate-5:
     description: 'Enforce Mandate 5/8: abort if project has vercel.json installCommand or local .npmrc'
     required: false
