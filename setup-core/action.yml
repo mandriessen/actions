@@ -1,0 +1,141 @@
+name: 'Setup Core'
+description: 'Neural Leap fleet setup — Node + @mandriessen/core auth + install + fleet antipattern guards + secret scan'
+author: 'Neural Leap'
+
+inputs:
+  node-version:
+    description: 'Node.js version (default: read from .nvmrc, fallback 24)'
+    required: false
+    default: ''
+  gh-pkg-token:
+    description: 'GitHub Packages read token. Pass secrets.GH_PKG_TOKEN (fleet-canonical secret name).'
+    required: true
+  run-gitleaks:
+    description: 'Run gitleaks secret scan on the checkout (set "false" only if another step already does this)'
+    required: false
+    default: 'true'
+  enforce-mandate-5:
+    description: 'Enforce Mandate 5/8: abort if project has vercel.json installCommand or local .npmrc'
+    required: false
+    default: 'true'
+  core-min-version:
+    description: 'Minimum @mandriessen/core version. If package-lock.json resolves lower, fail. Pass empty to skip.'
+    required: false
+    default: '2.2.0'
+
+outputs:
+  node-version-used:
+    description: 'The Node.js version actually used'
+    value: ${{ steps.node.outputs.node-version }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ---- 1. Gitleaks secret scan (pre-install; cheap, blocks leaked tokens from reaching registry)
+    - name: Gitleaks — secret scan
+      if: inputs.run-gitleaks == 'true'
+      uses: gitleaks/gitleaks-action@v2
+      env:
+        GITHUB_TOKEN: ${{ inputs.gh-pkg-token }}
+        # If no .gitleaks.toml in consumer, gitleaks uses its sensible defaults
+        GITLEAKS_ENABLE_COMMENTS: 'false'
+        GITLEAKS_ENABLE_UPLOAD_ARTIFACT: 'true'
+
+    # ---- 2. Mandate 5/8 enforcement (CI-side; closes chicken-and-egg gap from 2026-04-17 incident)
+    - name: Enforce Mandate 5/8 (no installCommand, no per-project .npmrc)
+      if: inputs.enforce-mandate-5 == 'true'
+      shell: bash
+      run: |
+        FAIL=0
+        if [ -f vercel.json ]; then
+          if grep -q '"installCommand"' vercel.json; then
+            echo "::error file=vercel.json::MANDATE 5/8 VIOLATION — vercel.json has 'installCommand'. Blocks Vercel's NPM_RC→.npmrc auto-write. See mandriessen/neural-leap-config wiki/incidents/2026-04-17-vercel-installcommand-antipattern."
+            FAIL=1
+          fi
+        fi
+        if [ -f .npmrc ]; then
+          echo "::error file=.npmrc::MANDATE 8 VIOLATION — per-project .npmrc exists. Workspace-root .npmrc is the sole source of truth."
+          FAIL=1
+        fi
+        # Plaintext-secret artifact check
+        for pat in .env.vercel .env.vercel.prod .env.vercel.tmp .env.vercel.temp .env.preview.vercel .env.production.vercel; do
+          if [ -f "$pat" ]; then
+            echo "::error file=$pat::PLAINTEXT SECRET FILE detected. Delete and gitignore. See 2026-04-19-vercel-shared-env-stale-token incident."
+            FAIL=1
+          fi
+        done
+        for f in temp_env_ls_*.txt temp_env_ls_*; do
+          [ -f "$f" ] && { echo "::error file=$f::Vercel env dump file detected. Delete."; FAIL=1; }
+        done
+        [ $FAIL -eq 1 ] && exit 1 || echo "✅ Mandate 5/8 guards clean"
+
+    # ---- 3. Determine Node version (prefer .nvmrc if present)
+    - name: Resolve Node version
+      id: node-resolve
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.node-version }}" ]; then
+          echo "version=${{ inputs.node-version }}" >> "$GITHUB_OUTPUT"
+        elif [ -f .nvmrc ]; then
+          echo "version=$(cat .nvmrc | tr -d 'v\n')" >> "$GITHUB_OUTPUT"
+        else
+          echo "version=24" >> "$GITHUB_OUTPUT"
+        fi
+
+    # ---- 4. Setup Node + npm cache
+    - name: Setup Node
+      id: node
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ steps.node-resolve.outputs.version }}
+        cache: 'npm'
+        registry-url: 'https://npm.pkg.github.com'
+        scope: '@mandriessen'
+
+    # ---- 5. Write .npmrc (Vercel's NPM_RC behaviour — write the registry auth inline)
+    #      This is NOT a committed .npmrc — it's a build-time artifact, allowed in CI.
+    - name: Write build-time .npmrc
+      shell: bash
+      env:
+        GH_PKG_TOKEN: ${{ inputs.gh-pkg-token }}
+      run: |
+        cat > .npmrc <<EOF
+        @mandriessen:registry=https://npm.pkg.github.com
+        //npm.pkg.github.com/:_authToken=${GH_PKG_TOKEN}
+        legacy-peer-deps=true
+        EOF
+
+    # ---- 6. Install
+    - name: npm ci
+      shell: bash
+      env:
+        # User-level ~/.npmrc on dev machines uses ${GITHUB_TOKEN} — mirror for CI completeness
+        GITHUB_TOKEN: ${{ inputs.gh-pkg-token }}
+        GH_PKG_TOKEN: ${{ inputs.gh-pkg-token }}
+        GH_PACKAGES_TOKEN: ${{ inputs.gh-pkg-token }}
+      run: npm ci --legacy-peer-deps
+
+    # ---- 7. Cleanup — remove the build-time .npmrc so it can't accidentally persist
+    - name: Remove build-time .npmrc
+      if: always()
+      shell: bash
+      run: rm -f .npmrc
+
+    # ---- 8. Core version floor check (closes drift per wiki/versions/dependency-matrix.md)
+    - name: Verify @mandriessen/core minimum version
+      if: inputs.core-min-version != ''
+      shell: bash
+      run: |
+        INSTALLED=$(node -e "try { console.log(require('./node_modules/@mandriessen/core/package.json').version) } catch { console.log('NOT_INSTALLED') }")
+        if [ "$INSTALLED" = "NOT_INSTALLED" ]; then
+          echo "ℹ️ @mandriessen/core not installed in this project. Skipping version floor check."
+          exit 0
+        fi
+        MIN="${{ inputs.core-min-version }}"
+        # Simple semver compare using sort -V
+        LOWER=$(printf "%s\n%s\n" "$MIN" "$INSTALLED" | sort -V | head -1)
+        if [ "$LOWER" != "$MIN" ] && [ "$INSTALLED" != "$MIN" ]; then
+          echo "::error::@mandriessen/core@$INSTALLED is below minimum $MIN. Bump the dependency."
+          exit 1
+        fi
+        echo "✅ @mandriessen/core@$INSTALLED >= $MIN"
