@@ -22,6 +22,14 @@ inputs:
     description: 'Minimum @mandriessen/core version. If package-lock.json resolves lower, fail. Pass empty to skip.'
     required: false
     default: '2.2.0'
+  run-bundle-check:
+    description: 'After install, if a build has already been produced (e.g. .next/analyze/), report bundle sizes. Set "true" and run your build step BEFORE this composite'
+    required: false
+    default: 'false'
+  bundle-budget-first-load-kb:
+    description: 'Fail if first-load JS exceeds this many kB (whole numbers). Used only when run-bundle-check=true.'
+    required: false
+    default: ''
 
 outputs:
   node-version-used:
@@ -121,7 +129,33 @@ runs:
       shell: bash
       run: rm -f .npmrc
 
-    # ---- 8. Core version floor check (closes drift per wiki/versions/dependency-matrix.md)
+    # ---- 8. Bundle-size budget (audit item #4a MVP; opt-in)
+    - name: Report + gate bundle sizes
+      if: inputs.run-bundle-check == 'true'
+      shell: bash
+      run: |
+        # Look for Next's build manifest (first-load JS is in .next/build-manifest.json)
+        # and Webpack stats if present.
+        if [ ! -d .next ]; then
+          echo "::warning::run-bundle-check=true but .next/ is missing. Run 'npm run build' BEFORE setup-core if you want bundle-size gating."
+          exit 0
+        fi
+
+        # Compute size of client JS chunks in .next/static/chunks/
+        if [ -d .next/static/chunks ]; then
+          TOTAL_KB=$(find .next/static/chunks -name "*.js" -not -name "*.map" -exec du -k {} + | awk '{s+=$1} END {print s}')
+          echo "::notice::Client chunks total: ${TOTAL_KB} kB"
+          if [ -n "${{ inputs.bundle-budget-first-load-kb }}" ]; then
+            BUDGET="${{ inputs.bundle-budget-first-load-kb }}"
+            if [ "$TOTAL_KB" -gt "$BUDGET" ]; then
+              echo "::error::Client chunks (${TOTAL_KB} kB) exceed budget (${BUDGET} kB)"
+              exit 1
+            fi
+            echo "::notice::Within budget (${BUDGET} kB)"
+          fi
+        fi
+
+    # ---- 9. Core version floor check (closes drift per wiki/versions/dependency-matrix.md)
     - name: Verify @mandriessen/core minimum version
       if: inputs.core-min-version != ''
       shell: bash
